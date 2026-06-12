@@ -5,6 +5,7 @@ import UIKit
 import AVKit
 import Combine
 import MediaPlayer
+import ImageIO
 
 // MARK: - Main App Entry
 @main
@@ -32,25 +33,31 @@ struct MediaItem: Identifiable, Codable, Equatable {
     let creationDate: Date
     let fileName: String
     var deletionDate: Date?
+    var originalDate: Date?
     
     var url: URL {
         MediaManager.shared.getURL(for: fileName)
     }
     
+    var sortDate: Date {
+        originalDate ?? creationDate
+    }
+    
     var relativeDate: Date {
-        Calendar.current.startOfDay(for: creationDate)
+        Calendar.current.startOfDay(for: sortDate)
     }
     
     enum CodingKeys: String, CodingKey {
-        case id, type, creationDate, fileName, deletionDate
+        case id, type, creationDate, fileName, deletionDate, originalDate
     }
     
-    init(id: UUID, type: MediaType, creationDate: Date, fileName: String, deletionDate: Date? = nil) {
+    init(id: UUID, type: MediaType, creationDate: Date, fileName: String, deletionDate: Date? = nil, originalDate: Date? = nil) {
         self.id = id
         self.type = type
         self.creationDate = creationDate
         self.fileName = fileName
         self.deletionDate = deletionDate
+        self.originalDate = originalDate
     }
     
     init(from decoder: Decoder) throws {
@@ -60,6 +67,7 @@ struct MediaItem: Identifiable, Codable, Equatable {
         creationDate = try container.decode(Date.self, forKey: .creationDate)
         fileName = try container.decode(String.self, forKey: .fileName)
         deletionDate = try container.decodeIfPresent(Date.self, forKey: .deletionDate)
+        originalDate = try container.decodeIfPresent(Date.self, forKey: .originalDate)
     }
 }
 
@@ -86,7 +94,7 @@ class MediaManager: ObservableObject {
         return docs.appendingPathComponent(fileName)
     }
     
-    func saveMedia(data: Data, type: MediaType) {
+    func saveMedia(data: Data, type: MediaType, originalDate: Date? = nil) {
         let id = UUID()
         let ext = type == .photo ? "jpg" : "mp4"
         let fileName = "\(id.uuidString).\(ext)"
@@ -94,9 +102,10 @@ class MediaManager: ObservableObject {
         
         do {
             try data.write(to: url)
-            let newItem = MediaItem(id: id, type: type, creationDate: Date(), fileName: fileName)
+            let newItem = MediaItem(id: id, type: type, creationDate: Date(), fileName: fileName, originalDate: originalDate)
             DispatchQueue.main.async {
                 self.items.insert(newItem, at: 0)
+                self.sortItems()
                 self.saveMetadata()
             }
         } catch {
@@ -104,7 +113,7 @@ class MediaManager: ObservableObject {
         }
     }
     
-    func copyMedia(from sourceURL: URL, type: MediaType, move: Bool = false) {
+    func copyMedia(from sourceURL: URL, type: MediaType, move: Bool = false, originalDate: Date? = nil) {
         let id = UUID()
         let ext = type == .photo ? "jpg" : "mp4"
         let fileName = "\(id.uuidString).\(ext)"
@@ -116,9 +125,10 @@ class MediaManager: ObservableObject {
             } else {
                 try fileManager.copyItem(at: sourceURL, to: destURL)
             }
-            let newItem = MediaItem(id: id, type: type, creationDate: Date(), fileName: fileName)
+            let newItem = MediaItem(id: id, type: type, creationDate: Date(), fileName: fileName, originalDate: originalDate)
             DispatchQueue.main.async {
                 self.items.insert(newItem, at: 0)
+                self.sortItems()
                 self.saveMetadata()
             }
         } catch {
@@ -131,6 +141,16 @@ class MediaManager: ObservableObject {
             items[index].deletionDate = Date()
             saveMetadata()
         }
+    }
+    
+    func moveItemsToTrash(_ itemsToTrash: [MediaItem]) {
+        let ids = Set(itemsToTrash.map { $0.id })
+        for index in items.indices {
+            if ids.contains(items[index].id) {
+                items[index].deletionDate = Date()
+            }
+        }
+        saveMetadata()
     }
     
     func recoverItem(_ item: MediaItem) {
@@ -177,6 +197,11 @@ class MediaManager: ObservableObject {
         ExportHelper.shared.export(url: item.url, type: item.type)
     }
     
+    func exportMultiple(items: [MediaItem]) {
+        let urls = items.map { $0.url }
+        ExportHelper.shared.exportMultiple(urls: urls)
+    }
+    
     func deleteSystemAssets(identifiers: [String]) {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
             guard status == .authorized || status == .limited else { return }
@@ -193,10 +218,14 @@ class MediaManager: ObservableObject {
         }
     }
     
+    private func sortItems() {
+        self.items.sort { $0.sortDate > $1.sortDate }
+    }
+    
     private func loadMetadata() {
         if let data = UserDefaults.standard.data(forKey: metaDataKey),
            let decoded = JSONDecoder().decode([MediaItem].self, associations: data) {
-            self.items = decoded.sorted { $0.creationDate > $1.creationDate }
+            self.items = decoded.sorted { $0.sortDate > $1.sortDate }
         }
     }
 }
@@ -207,6 +236,10 @@ class ExportHelper: NSObject {
     
     func export(url: URL, type: MediaType) {
         presentShareSheet(for: [url], showSaveConfirmation: true)
+    }
+    
+    func exportMultiple(urls: [URL]) {
+        presentShareSheet(for: urls, showSaveConfirmation: true)
     }
     
     func exportAllToZip(items: [MediaItem]) {
@@ -346,9 +379,6 @@ struct CameraTabContainer: View {
     @State private var cameraMode: String = "PHOTO"
     let modes = ["PHOTO", "VIDEO"]
     @StateObject private var cameraEngine = CameraEngine()
-    @State private var isPickerPresented = false
-    @State private var identifiersToDelete: [String] = []
-    @State private var showDeletePrompt = false
     @StateObject private var volumeObserver = VolumeObserver()
     
     var body: some View {
@@ -361,11 +391,7 @@ struct CameraTabContainer: View {
             VStack {
                 // Top Utilities Bar
                 HStack {
-                    Button(action: { isPickerPresented = true }) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.title2)
-                            .foregroundColor(.white)
-                    }
+                    Color.clear.frame(width: 24, height: 24)
                     Spacer()
                     Text("Private Hub")
                         .font(.headline)
@@ -487,26 +513,6 @@ struct CameraTabContainer: View {
                 }
                 .padding(.bottom, 24)
             }
-        }
-        .sheet(isPresented: $isPickerPresented) {
-            // FIX 1: Pass isPresented binding down so UIKit doesn't force a dismissal
-            SystemMediaPicker(isPresented: $isPickerPresented) { identifiers in
-                if !identifiers.isEmpty {
-                    identifiersToDelete = identifiers
-                    // FIX 2: Wait for sheet to finish closing before presenting an alert
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                        showDeletePrompt = true
-                    }
-                }
-            }
-        }
-        .alert("Delete Imported Media?", isPresented: $showDeletePrompt) {
-            Button("Delete", role: .destructive) {
-                MediaManager.shared.deleteSystemAssets(identifiers: identifiersToDelete)
-            }
-            Button("Keep", role: .cancel) {}
-        } message: {
-            Text("Would you like to delete the imported media from your system Photo Library?")
         }
     }
     
@@ -768,10 +774,24 @@ struct SystemMediaPicker: UIViewControllerRepresentable {
             let group = DispatchGroup()
             let completion = parent.onImportComplete // Safely copy closure to avoid retention
             
+            // Pre-fetch original dates
+            var datesMap: [String: Date] = [:]
+            let assetIdentifiers = results.compactMap { $0.assetIdentifier }
+            if !assetIdentifiers.isEmpty {
+                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: assetIdentifiers, options: nil)
+                fetchResult.enumerateObjects { asset, _, _ in
+                    if let date = asset.creationDate {
+                        datesMap[asset.localIdentifier] = date
+                    }
+                }
+            }
+            
             for result in results {
-                if let identifier = result.assetIdentifier {
+                let assetId = result.assetIdentifier
+                if let identifier = assetId {
                     identifiers.append(identifier)
                 }
+                let originalDate = assetId.flatMap { datesMap[$0] }
                 
                 let provider = result.itemProvider
                 group.enter()
@@ -779,14 +799,14 @@ struct SystemMediaPicker: UIViewControllerRepresentable {
                 if provider.canLoadObject(ofClass: UIImage.self) {
                     provider.loadObject(ofClass: UIImage.self) { image, _ in
                         if let uiImage = image as? UIImage, let data = uiImage.jpegData(compressionQuality: 0.85) {
-                            MediaManager.shared.saveMedia(data: data, type: .photo)
+                            MediaManager.shared.saveMedia(data: data, type: .photo, originalDate: originalDate)
                         }
                         group.leave()
                     }
                 } else if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
                         if let url = url {
-                            MediaManager.shared.copyMedia(from: url, type: .video, move: false)
+                            MediaManager.shared.copyMedia(from: url, type: .video, move: false, originalDate: originalDate)
                         }
                         group.leave()
                     }
@@ -808,8 +828,16 @@ struct GalleryView: View {
     @State private var targetFullscreenItem: MediaItem?
     @State private var itemToTrash: MediaItem?
     
+    @State private var isPickerPresented = false
+    @State private var identifiersToDelete: [String] = []
+    @State private var showDeletePrompt = false
+    
+    @State private var isSelectMode = false
+    @State private var selectedItems: Set<UUID> = []
+    @State private var showMultiDeleteAlert = false
+    
     var activeItems: [MediaItem] {
-        manager.items.filter { $0.deletionDate == nil }
+        manager.items.filter { $0.deletionDate == nil }.sorted { $0.sortDate > $1.sortDate }
     }
     
     var groupedItems: [Date: [MediaItem]] {
@@ -830,8 +858,18 @@ struct GalleryView: View {
                         Section(header: Text(date, style: .date).font(.headline).foregroundColor(.gray).textCase(.uppercase).padding(.horizontal)) {
                             LazyVGrid(columns: columns, spacing: 4) {
                                 ForEach(groupedItems[date] ?? []) { item in
-                                    GalleryThumbnail(item: item)
-                                        .onTapGesture { targetFullscreenItem = item }
+                                    GalleryThumbnail(item: item, isSelected: selectedItems.contains(item.id), isSelectMode: isSelectMode)
+                                        .onTapGesture { 
+                                            if isSelectMode {
+                                                if selectedItems.contains(item.id) {
+                                                    selectedItems.remove(item.id)
+                                                } else {
+                                                    selectedItems.insert(item.id)
+                                                }
+                                            } else {
+                                                targetFullscreenItem = item 
+                                            }
+                                        }
                                         .contextMenu {
                                             Button { manager.export(item: item) } label: { Label("Share", systemImage: "square.and.arrow.up") }
                                             Button(role: .destructive) { itemToTrash = item } label: { Label("Remove Media", systemImage: "trash") }
@@ -845,11 +883,56 @@ struct GalleryView: View {
             }
             .navigationTitle("Secure Vault")
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Import") { isPickerPresented = true }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    NavigationLink(destination: RecentlyDeletedView()) {
-                        Image(systemName: "trash")
-                            .foregroundColor(.gray)
+                    HStack {
+                        Button(isSelectMode ? "Cancel" : "Select") {
+                            isSelectMode.toggle()
+                            if !isSelectMode { selectedItems.removeAll() }
+                        }
+                        if !isSelectMode {
+                            NavigationLink(destination: RecentlyDeletedView()) {
+                                Image(systemName: "trash")
+                                    .foregroundColor(.gray)
+                            }
+                        }
                     }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if isSelectMode {
+                    HStack {
+                        Button(action: {
+                            let itemsToExport = activeItems.filter { selectedItems.contains($0.id) }
+                            manager.exportMultiple(items: itemsToExport)
+                            isSelectMode = false
+                            selectedItems.removeAll()
+                        }) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.title2)
+                        }
+                        .disabled(selectedItems.isEmpty)
+                        
+                        Spacer()
+                        
+                        Text("\(selectedItems.count) Selected")
+                            .font(.subheadline)
+                        
+                        Spacer()
+                        
+                        Button(action: {
+                            showMultiDeleteAlert = true
+                        }) {
+                            Image(systemName: "trash")
+                                .font(.title2)
+                        }
+                        .disabled(selectedItems.isEmpty)
+                        .foregroundColor(selectedItems.isEmpty ? .gray : .red)
+                    }
+                    .padding()
+                    .background(Color(UIColor.systemBackground).edgesIgnoringSafeArea(.bottom))
                 }
             }
             .fullScreenCover(item: $targetFullscreenItem) { item in
@@ -863,6 +946,35 @@ struct GalleryView: View {
                     secondaryButton: .cancel()
                 )
             }
+            .sheet(isPresented: $isPickerPresented) {
+                SystemMediaPicker(isPresented: $isPickerPresented) { identifiers in
+                    if !identifiers.isEmpty {
+                        identifiersToDelete = identifiers
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            showDeletePrompt = true
+                        }
+                    }
+                }
+            }
+            .alert("Delete Imported Media?", isPresented: $showDeletePrompt) {
+                Button("Delete", role: .destructive) {
+                    MediaManager.shared.deleteSystemAssets(identifiers: identifiersToDelete)
+                }
+                Button("Keep", role: .cancel) {}
+            } message: {
+                Text("Would you like to delete the imported media from your system Photo Library?")
+            }
+            .alert("Delete Selected Media?", isPresented: $showMultiDeleteAlert) {
+                Button("Delete", role: .destructive) {
+                    let itemsToDelete = activeItems.filter { selectedItems.contains($0.id) }
+                    manager.moveItemsToTrash(itemsToDelete)
+                    isSelectMode = false
+                    selectedItems.removeAll()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Are you sure you want to move the selected items to Recently Deleted?")
+            }
         }
     }
 }
@@ -873,7 +985,7 @@ struct RecentlyDeletedView: View {
     @State private var showDeleteAllPrompt = false
     
     var deletedItems: [MediaItem] {
-        manager.items.filter { $0.deletionDate != nil }.sorted { $0.creationDate > $1.creationDate }
+        manager.items.filter { $0.deletionDate != nil }.sorted { $0.sortDate > $1.sortDate }
     }
     
     let columns = [GridItem(.adaptive(minimum: 100, maximum: 150), spacing: 4)]
@@ -920,6 +1032,8 @@ struct RecentlyDeletedView: View {
 
 struct GalleryThumbnail: View {
     let item: MediaItem
+    var isSelected: Bool = false
+    var isSelectMode: Bool = false
     
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -945,6 +1059,21 @@ struct GalleryThumbnail: View {
                     .background(Color.black.opacity(0.6))
                     .cornerRadius(4)
                     .padding(6)
+            }
+            
+            if isSelectMode {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 22))
+                            .foregroundColor(isSelected ? .blue : .white)
+                            .background(Circle().fill(Color.black.opacity(0.3)))
+                            .clipShape(Circle())
+                            .padding(6)
+                    }
+                    Spacer()
+                }
             }
         }
         .frame(minWidth: 0, maxWidth: .infinity, minHeight: 110, maxHeight: 110)
@@ -993,9 +1122,10 @@ struct FullscreenMediaViewer: View {
     @Environment(\.presentationMode) var presentationMode
     @State private var selectedItemId: UUID?
     @State private var itemToTrash: MediaItem?
+    @State private var itemForInfo: MediaItem?
     
     var activeItems: [MediaItem] {
-        manager.items.filter { $0.deletionDate == nil }.sorted { $0.creationDate > $1.creationDate }
+        manager.items.filter { $0.deletionDate == nil }.sorted { $0.sortDate > $1.sortDate }
     }
     
     var body: some View {
@@ -1010,6 +1140,20 @@ struct FullscreenMediaViewer: View {
                     }
                 }
                 .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
+                
+                if let currentMedia = activeItems.first(where: { $0.id == selectedItemId }) {
+                    VStack {
+                        Spacer()
+                        Text(currentMedia.sortDate.formatted(date: .long, time: .shortened))
+                            .font(.caption)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.black.opacity(0.6))
+                            .clipShape(Capsule())
+                            .padding(.bottom, 30)
+                    }
+                }
             }
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
@@ -1022,13 +1166,17 @@ struct FullscreenMediaViewer: View {
                     Button("Done") { presentationMode.wrappedValue.dismiss() }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    HStack(spacing: 40) {
+                    HStack(spacing: 24) {
                         if let currentMedia = activeItems.first(where: { $0.id == selectedItemId }) {
+                            Button(action: { itemForInfo = currentMedia }) { Image(systemName: "info.circle") }
                             Button(action: { MediaManager.shared.export(item: currentMedia) }) { Image(systemName: "square.and.arrow.up") }
                             Button(action: { itemToTrash = currentMedia }) { Image(systemName: "trash").foregroundColor(.red) }
                         }
                     }
                 }
+            }
+            .sheet(item: $itemForInfo) { item in
+                MediaInfoSheet(item: item)
             }
             .alert(item: $itemToTrash) { item in
                 Alert(
@@ -1117,6 +1265,95 @@ struct VideoFullscreenPlayer: UIViewControllerRepresentable {
     static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: ()) {
         uiViewController.player?.pause()
         uiViewController.player = nil
+    }
+}
+
+// MARK: - EXIF Info Formatter Base
+struct MediaInfoSheet: View {
+    let item: MediaItem
+    @State private var metadata: [String: String] = [:]
+    @Environment(\.presentationMode) var presentationMode
+    
+    var body: some View {
+        NavigationView {
+            List {
+                Section(header: Text("Date & Time")) {
+                    HStack {
+                        Text("Date Taken")
+                        Spacer()
+                        Text(item.sortDate.formatted(date: .long, time: .shortened))
+                            .foregroundColor(.gray)
+                    }
+                    HStack {
+                        Text("Imported On")
+                        Spacer()
+                        Text(item.creationDate.formatted(date: .long, time: .shortened))
+                            .foregroundColor(.gray)
+                    }
+                }
+                
+                if !metadata.isEmpty {
+                    Section(header: Text("Details")) {
+                        ForEach(metadata.keys.sorted(), id: \.self) { key in
+                            HStack {
+                                Text(key)
+                                Spacer()
+                                Text(metadata[key]!)
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Information")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                extractMetadata()
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+    
+    private func extractMetadata() {
+        var results: [String: String] = [:]
+        
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: item.url.path),
+           let size = attrs[.size] as? Int64 {
+            let formatter = ByteCountFormatter()
+            results["File Size"] = formatter.string(fromByteCount: size)
+        }
+        
+        if item.type == .photo {
+            guard let source = CGImageSourceCreateWithURL(item.url as CFURL, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else {
+                self.metadata = results
+                return
+            }
+            
+            if let width = properties[kCGImagePropertyPixelWidth as String] as? Int,
+               let height = properties[kCGImagePropertyPixelHeight as String] as? Int {
+                results["Resolution"] = "\(width) × \(height)"
+            }
+            
+            if let tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any],
+               let model = tiff[kCGImagePropertyTIFFModel as String] as? String {
+                results["Camera"] = model
+            }
+        } else {
+            let asset = AVURLAsset(url: item.url)
+            if let track = asset.tracks(withMediaType: .video).first {
+                results["Resolution"] = "\(Int(track.naturalSize.width)) × \(Int(track.naturalSize.height))"
+            }
+        }
+        
+        self.metadata = results
     }
 }
 
